@@ -1,0 +1,258 @@
+import pandas as pd
+import cv2
+import numpy as np
+import math
+import os
+
+# --- Leitura e Análise do CSV (Adicionado) ---
+try:
+    df_cores = pd.read_csv("Cores e Figuras - Página1.csv")
+    print("CSV de cores carregado com sucesso. Analisando...")
+    # --- AQUI VAI A LÓGICA DE ANÁLISE ---
+    # Exemplo: Calcular médias de H, S, V para cada tipo
+    # (Precisa adaptar às colunas reais do seu CSV)
+    # Exemplo hipotético de análise:
+    # media_saturacao_navio = df_cores[df_cores['Tipo'] == 'Navio']['Saturacao'].mean()
+    # media_saturacao_alga = df_cores[df_cores['Tipo'] == 'Alga']['Saturacao'].mean()
+    # media_valor_mancha = df_cores[df_cores['Tipo'] == 'Mancha']['Valor'].mean()
+    # print(f"Saturação média Navio: {media_saturacao_navio}, Alga: {media_saturacao_alga}")
+    # print(f"Valor médio Mancha: {media_valor_mancha}")
+
+    # --- DEFINIÇÃO DOS NOVOS LIMIARES (Ajustar com base na análise real) ---
+    # Exemplo: Se a análise mostrar que Navios têm S > 60 e Algas S < 60
+    SATURATION_THRESHOLD_NAVIO_AJUSTADO = 65 # Exemplo de ajuste
+    # Exemplo: Se a mancha tem V < 95
+    OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO = 95 # Exemplo de ajuste
+
+except FileNotFoundError:
+    print("Erro: Arquivo 'Cores e Figuras - Página1.csv' não encontrado.")
+    print("Usando limiares padrão.")
+    SATURATION_THRESHOLD_NAVIO_AJUSTADO = 70
+    OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO = 90
+except Exception as e:
+    print(f"Erro ao ler ou analisar o CSV: {e}")
+    print("Usando limiares padrão.")
+    SATURATION_THRESHOLD_NAVIO_AJUSTADO = 70
+    OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO = 90
+
+# --- 1. FUNÇÕES AUXILIARES ---
+def distancia(p1, p2):
+    if p1 is None or p2 is None or len(p1) < 2 or len(p2) < 2: return float('inf')
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+def mapear_coordenadas(ponto_pixel, dimensoes_imagem, range_lon, range_lat):
+    px, py = ponto_pixel
+    largura, altura = dimensoes_imagem
+    if largura == 0 or altura == 0: return (0.0, 0.0)
+    lon = range_lon[0] + (px / largura) * (range_lon[1] - range_lon[0])
+    lat = range_lat[1] - (py / altura) * (range_lat[1] - range_lat[0])
+    return (round(lon, 6), round(lat, 6))
+
+# --- FUNÇÃO DE VISUALIZAÇÃO ---
+def visualizar_deteccoes(imagem, pontos_detectados, navio_poluidor_coords_pixel=None):
+    imagem_visual = imagem.copy()
+    for ponto in pontos_detectados:
+        if 'coords_pixel_original' not in ponto: continue
+        coords_pixel = ponto['coords_pixel_original']
+        tipo = ponto.get('tipo', 'Desconhecido')
+        centro = (int(coords_pixel[0]), int(coords_pixel[1]))
+        
+        if 'Navio' in tipo: cor = (255, 0, 0)
+        elif tipo == 'Mancha de Oleo': cor = (0, 0, 255)
+        else: cor = (0, 255, 255)
+        
+        raio_visual = 20 if tipo == 'Alga' else (35 if 'Navio' in tipo else 30)
+        cv2.circle(imagem_visual, centro, raio_visual, cor, 3)
+        
+        texto, texto_cor = tipo, cor
+        if navio_poluidor_coords_pixel is not None and 'Navio Poluidor' in tipo:
+             if abs(centro[0] - navio_poluidor_coords_pixel[0]) < 15 and \
+                abs(centro[1] - navio_poluidor_coords_pixel[1]) < 15:
+                cv2.circle(imagem_visual, centro, raio_visual + 10, (0, 165, 255), 3)
+                texto_cor = (0, 255, 100)
+
+        cv2.putText(imagem_visual, texto, (centro[0] - 50, centro[1] - raio_visual - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, texto_cor, 2)
+    return imagem_visual
+
+# --- 2. FUNÇÕES DE DETECÇÃO (usando os limiares ajustados) ---
+def detectar_e_agrupar_mancha(imagem, params_mancha, brightness_max_mancha):
+    mask_mancha = np.zeros(imagem.shape[:2], dtype="uint8")
+    componentes_mancha = []
+    contornos_mancha = []
+    try:
+        imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+        imagem_suavizada = cv2.medianBlur(imagem_cinza, 5)
+        circulos_pequenos = cv2.HoughCircles(imagem_suavizada, cv2.HOUGH_GRADIENT,
+                                             dp=params_mancha['dp'], minDist=params_mancha['minDist'],
+                                             param1=params_mancha['param1'], param2=params_mancha['param2'],
+                                             minRadius=params_mancha['minRadius'], maxRadius=params_mancha['maxRadius'])
+        if circulos_pequenos is not None:
+            circulos_pequenos = np.uint16(np.around(circulos_pequenos))
+            for i in circulos_pequenos[0, :]:
+                centro = (i[0], i[1])
+                raio = i[2]
+                if 0 <= centro[1] < imagem.shape[0] and 0 <= centro[0] < imagem.shape[1]:
+                    bgr = imagem[centro[1], centro[0]]
+                    hsv_pixel = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
+                    if hsv_pixel[2] < brightness_max_mancha: # Usa o limiar ajustado
+                        componentes_mancha.append(centro)
+                        contorno_circular = np.array([[[int(centro[0] + raio * np.cos(a)), int(centro[1] + raio * np.sin(a))]] for a in np.linspace(0, 2 * np.pi, 20)], dtype=np.int32)
+                        contornos_mancha.append(contorno_circular)
+        if componentes_mancha:
+            avg_x = int(np.mean([p[0] for p in componentes_mancha]))
+            avg_y = int(np.mean([p[1] for p in componentes_mancha]))
+            cv2.drawContours(mask_mancha, contornos_mancha, -1, 255, -1)
+            mancha_detectada = [{'tipo': 'Mancha de Oleo', 'coords_pixel': (avg_x, avg_y)}]
+            return mancha_detectada, mask_mancha
+    except Exception as e:
+        print(f"Erro ao detectar mancha: {e}")
+    return [], mask_mancha
+
+def detectar_navios_e_algas(imagem, params_navios, sat_threshold):
+    pontos_finais = []
+    try:
+        imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+        imagem_suavizada = cv2.medianBlur(imagem_cinza, 9)
+        circulos_grandes = cv2.HoughCircles(imagem_suavizada, cv2.HOUGH_GRADIENT,
+                                            dp=params_navios['dp'], minDist=params_navios['minDist'],
+                                            param1=params_navios['param1'], param2=params_navios['param2'],
+                                            minRadius=params_navios['minRadius'], maxRadius=params_navios['maxRadius'])
+        if circulos_grandes is not None:
+            circulos_grandes = np.uint16(np.around(circulos_grandes))
+            for i in circulos_grandes[0, :]:
+                centro = (i[0], i[1])
+                if 0 <= centro[1] < imagem.shape[0] and 0 <= centro[0] < imagem.shape[1]:
+                    bgr = imagem[centro[1], centro[0]]
+                    hsv_pixel = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
+                    # --- AQUI USA O LIMIAR AJUSTADO ---
+                    if hsv_pixel[1] > sat_threshold:
+                        pontos_finais.append({'tipo': 'Navio', 'coords_pixel': centro})
+                    else:
+                        pontos_finais.append({'tipo': 'Alga', 'coords_pixel': centro})
+    except Exception as e:
+        print(f"Erro ao detectar navios/algas: {e}")
+    return pontos_finais
+
+# --- 3. BLOCO DE EXECUÇÃO PRINCIPAL ---
+if __name__ == "__main__":
+    # --- BLOCO DE CALIBRAGEM (Usa os valores ajustados pela análise do CSV) ---
+    ROI_PROPORCOES = {'y_start': 0.12, 'y_end': 0.93, 'x_start': 0.05, 'x_end': 0.96}
+    HOUGH_PARAMS_NAVIOS = {'dp': 1, 'minDist': 40, 'param1': 50, 'param2': 11, 'minRadius': 15, 'maxRadius': 55}
+    HOUGH_PARAMS_MANCHA = {'dp': 1, 'minDist': 5, 'param1': 50, 'param2': 8, 'minRadius': 5, 'maxRadius': 15}
+
+    # Usa os limiares derivados da análise do CSV (ou os padrões se a análise falhar)
+    SATURATION_THRESHOLD_NAVIO = SATURATION_THRESHOLD_NAVIO_AJUSTADO
+    OIL_SLICK_BRIGHTNESS_MAX = OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO
+    
+    RANGE_LONGITUDE = (-220, 220)
+    RANGE_LATITUDE = (-220, 220)
+    NUM_SIMULACOES = 200
+    # --- FIM DO BLOCO ---
+
+    base_path_imagens = r"C:\Users\0077796\Downloads\200Figuras-20251024T181451Z-1-001\200Figuras"
+    output_folder_resultados = r"C:\Users\0077796\Downloads\Resultados_Simulacoes"
+    output_csv_consolidado = r"C:\Users\0077796\Downloads\relatorio_consolidado.csv"
+
+    try:
+        os.makedirs(output_folder_resultados, exist_ok=True)
+        print(f"Pasta de resultados '{output_folder_resultados}' verificada/criada.")
+    except OSError as error:
+        print(f"Erro ao criar a pasta de resultados: {error}")
+        exit()
+
+    todos_os_dados_consolidados = []
+
+    for i in range(1, NUM_SIMULACOES + 1):
+        print(f"\n--- Processando Simulação {i}/{NUM_SIMULACOES} ---")
+        nome_arquivo_sim = f"sim_{i}.png"
+        caminho_imagem = os.path.join(base_path_imagens, nome_arquivo_sim)
+        nome_imagem_saida = f"deteccao_vazamento_oleo_{i}.png"
+        caminho_imagem_saida = os.path.join(output_folder_resultados, nome_imagem_saida)
+
+        imagem_original = cv2.imread(caminho_imagem)
+        if imagem_original is None:
+            print(f"Erro: Imagem '{caminho_imagem}' não encontrada. Pulando.")
+            continue
+
+        altura, largura, _ = imagem_original.shape
+        x_roi_start = int(largura * ROI_PROPORCOES['x_start'])
+        y_roi_start = int(altura * ROI_PROPORCOES['y_start'])
+        x_roi_end = int(largura * ROI_PROPORCOES['x_end'])
+        y_roi_end = int(altura * ROI_PROPORCOES['y_end'])
+
+        if x_roi_start >= x_roi_end or y_roi_start >= y_roi_end:
+             print(f"Erro: ROI inválida para simulação {i}. Pulando.")
+             continue
+        imagem_roi = imagem_original[y_roi_start:y_roi_end, x_roi_start:x_roi_end].copy()
+
+        if imagem_roi.shape[0] > 0 and imagem_roi.shape[1] > 0:
+            manchas, mascara_da_mancha = detectar_e_agrupar_mancha(imagem_roi, HOUGH_PARAMS_MANCHA, OIL_SLICK_BRIGHTNESS_MAX)
+
+            imagem_roi_sem_mancha = imagem_roi.copy()
+            kernel = np.ones((15, 15), np.uint8)
+            mascara_dilatada = cv2.dilate(mascara_da_mancha, kernel, iterations=1)
+            cor_fundo_bgr = imagem_roi[5, 5]
+            imagem_roi_sem_mancha[mascara_dilatada == 255] = tuple(map(int, cor_fundo_bgr)) # Garante que a cor seja tupla de int
+
+            navios_e_algas = detectar_navios_e_algas(imagem_roi_sem_mancha, HOUGH_PARAMS_NAVIOS, SATURATION_THRESHOLD_NAVIO)
+            
+            todos_os_pontos_sim = manchas + navios_e_algas
+            print(f"Simulação {i}: {len(todos_os_pontos_sim)} pontos detectados.")
+
+            navio_poluidor_coords_pixel = None
+            for ponto in todos_os_pontos_sim:
+                if 'coords_pixel' not in ponto: continue
+                ponto['coords_pixel_original'] = (ponto['coords_pixel'][0] + x_roi_start, ponto['coords_pixel'][1] + y_roi_start)
+                ponto['coords_reais'] = mapear_coordenadas(ponto['coords_pixel_original'], (largura, altura), RANGE_LONGITUDE, RANGE_LATITUDE)
+                ponto['Simulacao_ID'] = i
+
+            manchas_final_sim = [p for p in todos_os_pontos_sim if p.get('tipo') == 'Mancha de Oleo']
+            navios_final_sim = [p for p in todos_os_pontos_sim if p.get('tipo') == 'Navio']
+
+            if manchas_final_sim and navios_final_sim:
+                mancha_oleo_final_sim = manchas_final_sim[0]
+                menor_dist = float('inf')
+                navio_poluidor_sim = None
+                for navio in navios_final_sim:
+                     if 'coords_reais' in mancha_oleo_final_sim and 'coords_reais' in navio:
+                         d = distancia(mancha_oleo_final_sim['coords_reais'], navio['coords_reais'])
+                         if d < menor_dist:
+                             menor_dist = d
+                             navio_poluidor_sim = navio
+                if navio_poluidor_sim:
+                    navio_poluidor_sim['tipo'] = 'Navio Poluidor'
+                    if 'coords_reais' in mancha_oleo_final_sim and 'coords_reais' in navio_poluidor_sim and 'coords_pixel_original' in navio_poluidor_sim:
+                        coord_mancha = mancha_oleo_final_sim['coords_reais']
+                        coord_navio = navio_poluidor_sim['coords_reais']
+                        navio_poluidor_coords_pixel = navio_poluidor_sim['coords_pixel_original']
+                        print(f"  > Mancha: ({coord_mancha[0]:.6f}, {coord_mancha[1]:.6f}) | Poluidor: ({coord_navio[0]:.6f}, {coord_navio[1]:.6f}) | Dist: {menor_dist:.2f}")
+                    else: print("  > Análise de proximidade falhou: coords ausentes.")
+            else: print("  > Análise de proximidade não realizada.")
+
+            for ponto in todos_os_pontos_sim:
+                 if all(k in ponto for k in ('tipo', 'coords_reais', 'Simulacao_ID')):
+                     todos_os_dados_consolidados.append({'Simulacao_ID': ponto['Simulacao_ID'], 'ID_Ponto': f"{ponto['tipo'].replace(' ', '_')}_{len(todos_os_dados_consolidados)}", 'Tipo': ponto['tipo'], 'Longitude': ponto['coords_reais'][0], 'Latitude': ponto['coords_reais'][1]})
+            try:
+                imagem_resultado = visualizar_deteccoes(imagem_original, todos_os_pontos_sim, navio_poluidor_coords_pixel)
+                cv2.imwrite(caminho_imagem_saida, imagem_resultado)
+                print(f"  > Imagem de resultado salva em '{caminho_imagem_saida}'")
+            except Exception as e:
+                print(f"  > Erro ao salvar imagem de resultado para simulação {i}: {e}")
+        else:
+            print(f"Erro: A ROI resultante para a simulação {i} é inválida.")
+
+    print("\n--- Processamento Concluído ---")
+    if todos_os_dados_consolidados:
+        df_consolidado = pd.DataFrame(todos_os_dados_consolidados)
+        try:
+            df_consolidado.to_csv(output_csv_consolidado, index=False)
+            print(f"Relatório consolidado salvo em '{output_csv_consolidado}'")
+            pd.set_option('display.float_format', '{:.6f}'.format)
+            print("\n--- Amostra do Relatório Consolidado ---")
+            print(df_consolidado.head())
+            print(f"\nTotal de pontos detectados em todas as simulações: {len(df_consolidado)}")
+        except Exception as e:
+            print(f"Erro ao salvar o relatório consolidado: {e}")
+    else:
+        print("Nenhum ponto detectado. Relatório consolidado não gerado.")
+
