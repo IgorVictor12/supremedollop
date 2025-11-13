@@ -1,258 +1,408 @@
-import pandas as pd
 import cv2
 import numpy as np
-import math
-import os
+import time
+import sys
+from scipy.spatial.distance import cdist # Para calcular a distância entre os pontos
 
-# --- Leitura e Análise do CSV (Adicionado) ---
-try:
-    df_cores = pd.read_csv("Cores e Figuras - Página1.csv")
-    print("CSV de cores carregado com sucesso. Analisando...")
-    # --- AQUI VAI A LÓGICA DE ANÁLISE ---
-    # Exemplo: Calcular médias de H, S, V para cada tipo
-    # (Precisa adaptar às colunas reais do seu CSV)
-    # Exemplo hipotético de análise:
-    # media_saturacao_navio = df_cores[df_cores['Tipo'] == 'Navio']['Saturacao'].mean()
-    # media_saturacao_alga = df_cores[df_cores['Tipo'] == 'Alga']['Saturacao'].mean()
-    # media_valor_mancha = df_cores[df_cores['Tipo'] == 'Mancha']['Valor'].mean()
-    # print(f"Saturação média Navio: {media_saturacao_navio}, Alga: {media_saturacao_alga}")
-    # print(f"Valor médio Mancha: {media_valor_mancha}")
-
-    # --- DEFINIÇÃO DOS NOVOS LIMIARES (Ajustar com base na análise real) ---
-    # Exemplo: Se a análise mostrar que Navios têm S > 60 e Algas S < 60
-    SATURATION_THRESHOLD_NAVIO_AJUSTADO = 65 # Exemplo de ajuste
-    # Exemplo: Se a mancha tem V < 95
-    OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO = 95 # Exemplo de ajuste
-
-except FileNotFoundError:
-    print("Erro: Arquivo 'Cores e Figuras - Página1.csv' não encontrado.")
-    print("Usando limiares padrão.")
-    SATURATION_THRESHOLD_NAVIO_AJUSTADO = 70
-    OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO = 90
-except Exception as e:
-    print(f"Erro ao ler ou analisar o CSV: {e}")
-    print("Usando limiares padrão.")
-    SATURATION_THRESHOLD_NAVIO_AJUSTADO = 70
-    OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO = 90
-
-# --- 1. FUNÇÕES AUXILIARES ---
-def distancia(p1, p2):
-    if p1 is None or p2 is None or len(p1) < 2 or len(p2) < 2: return float('inf')
-    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-
-def mapear_coordenadas(ponto_pixel, dimensoes_imagem, range_lon, range_lat):
-    px, py = ponto_pixel
-    largura, altura = dimensoes_imagem
-    if largura == 0 or altura == 0: return (0.0, 0.0)
-    lon = range_lon[0] + (px / largura) * (range_lon[1] - range_lon[0])
-    lat = range_lat[1] - (py / altura) * (range_lat[1] - range_lat[0])
-    return (round(lon, 6), round(lat, 6))
-
-# --- FUNÇÃO DE VISUALIZAÇÃO ---
-def visualizar_deteccoes(imagem, pontos_detectados, navio_poluidor_coords_pixel=None):
-    imagem_visual = imagem.copy()
-    for ponto in pontos_detectados:
-        if 'coords_pixel_original' not in ponto: continue
-        coords_pixel = ponto['coords_pixel_original']
-        tipo = ponto.get('tipo', 'Desconhecido')
-        centro = (int(coords_pixel[0]), int(coords_pixel[1]))
+class ProfessionalVisionSystem:
+    def __init__(self, camera_index=0):
+        self.cap = cv2.VideoCapture(camera_index)
         
-        if 'Navio' in tipo: cor = (255, 0, 0)
-        elif tipo == 'Mancha de Oleo': cor = (0, 0, 255)
-        else: cor = (0, 255, 255)
+        # Configura a câmera para resolução máxima disponível
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         
-        raio_visual = 20 if tipo == 'Alga' else (35 if 'Navio' in tipo else 30)
-        cv2.circle(imagem_visual, centro, raio_visual, cor, 3)
+        if not self.cap.isOpened():
+            raise ValueError("Não foi possível abrir a câmera.")
         
-        texto, texto_cor = tipo, cor
-        if navio_poluidor_coords_pixel is not None and 'Navio Poluidor' in tipo:
-             if abs(centro[0] - navio_poluidor_coords_pixel[0]) < 15 and \
-                abs(centro[1] - navio_poluidor_coords_pixel[1]) < 15:
-                cv2.circle(imagem_visual, centro, raio_visual + 10, (0, 165, 255), 3)
-                texto_cor = (0, 255, 100)
+        # Armazena as dimensões reais que a câmera conseguiu abrir
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Câmera iniciada com resolução: {self.frame_width}x{self.frame_height}")
 
-        cv2.putText(imagem_visual, texto, (centro[0] - 50, centro[1] - raio_visual - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, texto_cor, 2)
-    return imagem_visual
+        # --- PARÂMETROS DE CALIBRAÇÃO DE LENTE (Estimativa para remover Olho de Peixe) ---
+        # Em um cenário real, isso é obtido fotografando um tabuleiro de xadrez.
+        # Estes valores são genéricos para "alisar" a imagem.
+        # NOTA: Estes valores (cx, cy) devem ser baseados na resolução REAL da câmera (self.frame_width / 2, self.frame_height / 2)
+        center_x = self.frame_width / 2
+        center_y = self.frame_height / 2
+        
+        # Usando uma estimativa de distância focal (f) de 1000 para uma distorção leve
+        f = 1000.0 
+        self.mtx = np.array([[f, 0, center_x],
+                             [0, f, center_y],
+                             [0, 0, 1]])
+        self.dist = np.array([-0.2, 0.1, 0, 0]) # Coeficientes de distorção (k1, k2, p1, p2)
 
-# --- 2. FUNÇÕES DE DETECÇÃO (usando os limiares ajustados) ---
-def detectar_e_agrupar_mancha(imagem, params_mancha, brightness_max_mancha):
-    mask_mancha = np.zeros(imagem.shape[:2], dtype="uint8")
-    componentes_mancha = []
-    contornos_mancha = []
-    try:
-        imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
-        imagem_suavizada = cv2.medianBlur(imagem_cinza, 5)
-        circulos_pequenos = cv2.HoughCircles(imagem_suavizada, cv2.HOUGH_GRADIENT,
-                                             dp=params_mancha['dp'], minDist=params_mancha['minDist'],
-                                             param1=params_mancha['param1'], param2=params_mancha['param2'],
-                                             minRadius=params_mancha['minRadius'], maxRadius=params_mancha['maxRadius'])
-        if circulos_pequenos is not None:
-            circulos_pequenos = np.uint16(np.around(circulos_pequenos))
-            for i in circulos_pequenos[0, :]:
-                centro = (i[0], i[1])
-                raio = i[2]
-                if 0 <= centro[1] < imagem.shape[0] and 0 <= centro[0] < imagem.shape[1]:
-                    bgr = imagem[centro[1], centro[0]]
-                    hsv_pixel = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-                    if hsv_pixel[2] < brightness_max_mancha: # Usa o limiar ajustado
-                        componentes_mancha.append(centro)
-                        contorno_circular = np.array([[[int(centro[0] + raio * np.cos(a)), int(centro[1] + raio * np.sin(a))]] for a in np.linspace(0, 2 * np.pi, 20)], dtype=np.int32)
-                        contornos_mancha.append(contorno_circular)
-        if componentes_mancha:
-            avg_x = int(np.mean([p[0] for p in componentes_mancha]))
-            avg_y = int(np.mean([p[1] for p in componentes_mancha]))
-            cv2.drawContours(mask_mancha, contornos_mancha, -1, 255, -1)
-            mancha_detectada = [{'tipo': 'Mancha de Oleo', 'coords_pixel': (avg_x, avg_y)}]
-            return mancha_detectada, mask_mancha
-    except Exception as e:
-        print(f"Erro ao detectar mancha: {e}")
-    return [], mask_mancha
-
-def detectar_navios_e_algas(imagem, params_navios, sat_threshold):
-    pontos_finais = []
-    try:
-        imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
-        imagem_suavizada = cv2.medianBlur(imagem_cinza, 9)
-        circulos_grandes = cv2.HoughCircles(imagem_suavizada, cv2.HOUGH_GRADIENT,
-                                            dp=params_navios['dp'], minDist=params_navios['minDist'],
-                                            param1=params_navios['param1'], param2=params_navios['param2'],
-                                            minRadius=params_navios['minRadius'], maxRadius=params_navios['maxRadius'])
-        if circulos_grandes is not None:
-            circulos_grandes = np.uint16(np.around(circulos_grandes))
-            for i in circulos_grandes[0, :]:
-                centro = (i[0], i[1])
-                if 0 <= centro[1] < imagem.shape[0] and 0 <= centro[0] < imagem.shape[1]:
-                    bgr = imagem[centro[1], centro[0]]
-                    hsv_pixel = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-                    # --- AQUI USA O LIMIAR AJUSTADO ---
-                    if hsv_pixel[1] > sat_threshold:
-                        pontos_finais.append({'tipo': 'Navio', 'coords_pixel': centro})
-                    else:
-                        pontos_finais.append({'tipo': 'Alga', 'coords_pixel': centro})
-    except Exception as e:
-        print(f"Erro ao detectar navios/algas: {e}")
-    return pontos_finais
-
-# --- 3. BLOCO DE EXECUÇÃO PRINCIPAL ---
-if __name__ == "__main__":
-    # --- BLOCO DE CALIBRAGEM (Usa os valores ajustados pela análise do CSV) ---
-    ROI_PROPORCOES = {'y_start': 0.12, 'y_end': 0.93, 'x_start': 0.05, 'x_end': 0.96}
-    HOUGH_PARAMS_NAVIOS = {'dp': 1, 'minDist': 40, 'param1': 50, 'param2': 11, 'minRadius': 15, 'maxRadius': 55}
-    HOUGH_PARAMS_MANCHA = {'dp': 1, 'minDist': 5, 'param1': 50, 'param2': 8, 'minRadius': 5, 'maxRadius': 15}
-
-    # Usa os limiares derivados da análise do CSV (ou os padrões se a análise falhar)
-    SATURATION_THRESHOLD_NAVIO = SATURATION_THRESHOLD_NAVIO_AJUSTADO
-    OIL_SLICK_BRIGHTNESS_MAX = OIL_SLICK_BRIGHTNESS_MAX_AJUSTADO
-    
-    RANGE_LONGITUDE = (-220, 220)
-    RANGE_LATITUDE = (-220, 220)
-    NUM_SIMULACOES = 200
-    # --- FIM DO BLOCO ---
-
-    base_path_imagens = r"C:\Users\0077796\Downloads\200Figuras-20251024T181451Z-1-001\200Figuras"
-    output_folder_resultados = r"C:\Users\0077796\Downloads\Resultados_Simulacoes"
-    output_csv_consolidado = r"C:\Users\0077796\Downloads\relatorio_consolidado.csv"
-
-    try:
-        os.makedirs(output_folder_resultados, exist_ok=True)
-        print(f"Pasta de resultados '{output_folder_resultados}' verificada/criada.")
-    except OSError as error:
-        print(f"Erro ao criar a pasta de resultados: {error}")
-        exit()
-
-    todos_os_dados_consolidados = []
-
-    for i in range(1, NUM_SIMULACOES + 1):
-        print(f"\n--- Processando Simulação {i}/{NUM_SIMULACOES} ---")
-        nome_arquivo_sim = f"sim_{i}.png"
-        caminho_imagem = os.path.join(base_path_imagens, nome_arquivo_sim)
-        nome_imagem_saida = f"deteccao_vazamento_oleo_{i}.png"
-        caminho_imagem_saida = os.path.join(output_folder_resultados, nome_imagem_saida)
-
-        imagem_original = cv2.imread(caminho_imagem)
-        if imagem_original is None:
-            print(f"Erro: Imagem '{caminho_imagem}' não encontrada. Pulando.")
-            continue
-
-        altura, largura, _ = imagem_original.shape
-        x_roi_start = int(largura * ROI_PROPORCOES['x_start'])
-        y_roi_start = int(altura * ROI_PROPORCOES['y_start'])
-        x_roi_end = int(largura * ROI_PROPORCOES['x_end'])
-        y_roi_end = int(altura * ROI_PROPORCOES['y_end'])
-
-        if x_roi_start >= x_roi_end or y_roi_start >= y_roi_end:
-             print(f"Erro: ROI inválida para simulação {i}. Pulando.")
-             continue
-        imagem_roi = imagem_original[y_roi_start:y_roi_end, x_roi_start:x_roi_end].copy()
-
-        if imagem_roi.shape[0] > 0 and imagem_roi.shape[1] > 0:
-            manchas, mascara_da_mancha = detectar_e_agrupar_mancha(imagem_roi, HOUGH_PARAMS_MANCHA, OIL_SLICK_BRIGHTNESS_MAX)
-
-            imagem_roi_sem_mancha = imagem_roi.copy()
-            kernel = np.ones((15, 15), np.uint8)
-            mascara_dilatada = cv2.dilate(mascara_da_mancha, kernel, iterations=1)
-            cor_fundo_bgr = imagem_roi[5, 5]
-            imagem_roi_sem_mancha[mascara_dilatada == 255] = tuple(map(int, cor_fundo_bgr)) # Garante que a cor seja tupla de int
-
-            navios_e_algas = detectar_navios_e_algas(imagem_roi_sem_mancha, HOUGH_PARAMS_NAVIOS, SATURATION_THRESHOLD_NAVIO)
-            
-            todos_os_pontos_sim = manchas + navios_e_algas
-            print(f"Simulação {i}: {len(todos_os_pontos_sim)} pontos detectados.")
-
-            navio_poluidor_coords_pixel = None
-            for ponto in todos_os_pontos_sim:
-                if 'coords_pixel' not in ponto: continue
-                ponto['coords_pixel_original'] = (ponto['coords_pixel'][0] + x_roi_start, ponto['coords_pixel'][1] + y_roi_start)
-                ponto['coords_reais'] = mapear_coordenadas(ponto['coords_pixel_original'], (largura, altura), RANGE_LONGITUDE, RANGE_LATITUDE)
-                ponto['Simulacao_ID'] = i
-
-            manchas_final_sim = [p for p in todos_os_pontos_sim if p.get('tipo') == 'Mancha de Oleo']
-            navios_final_sim = [p for p in todos_os_pontos_sim if p.get('tipo') == 'Navio']
-
-            if manchas_final_sim and navios_final_sim:
-                mancha_oleo_final_sim = manchas_final_sim[0]
-                menor_dist = float('inf')
-                navio_poluidor_sim = None
-                for navio in navios_final_sim:
-                     if 'coords_reais' in mancha_oleo_final_sim and 'coords_reais' in navio:
-                         d = distancia(mancha_oleo_final_sim['coords_reais'], navio['coords_reais'])
-                         if d < menor_dist:
-                             menor_dist = d
-                             navio_poluidor_sim = navio
-                if navio_poluidor_sim:
-                    navio_poluidor_sim['tipo'] = 'Navio Poluidor'
-                    if 'coords_reais' in mancha_oleo_final_sim and 'coords_reais' in navio_poluidor_sim and 'coords_pixel_original' in navio_poluidor_sim:
-                        coord_mancha = mancha_oleo_final_sim['coords_reais']
-                        coord_navio = navio_poluidor_sim['coords_reais']
-                        navio_poluidor_coords_pixel = navio_poluidor_sim['coords_pixel_original']
-                        print(f"  > Mancha: ({coord_mancha[0]:.6f}, {coord_mancha[1]:.6f}) | Poluidor: ({coord_navio[0]:.6f}, {coord_navio[1]:.6f}) | Dist: {menor_dist:.2f}")
-                    else: print("  > Análise de proximidade falhou: coords ausentes.")
-            else: print("  > Análise de proximidade não realizada.")
-
-            for ponto in todos_os_pontos_sim:
-                 if all(k in ponto for k in ('tipo', 'coords_reais', 'Simulacao_ID')):
-                     todos_os_dados_consolidados.append({'Simulacao_ID': ponto['Simulacao_ID'], 'ID_Ponto': f"{ponto['tipo'].replace(' ', '_')}_{len(todos_os_dados_consolidados)}", 'Tipo': ponto['tipo'], 'Longitude': ponto['coords_reais'][0], 'Latitude': ponto['coords_reais'][1]})
-            try:
-                imagem_resultado = visualizar_deteccoes(imagem_original, todos_os_pontos_sim, navio_poluidor_coords_pixel)
-                cv2.imwrite(caminho_imagem_saida, imagem_resultado)
-                print(f"  > Imagem de resultado salva em '{caminho_imagem_saida}'")
-            except Exception as e:
-                print(f"  > Erro ao salvar imagem de resultado para simulação {i}: {e}")
-        else:
-            print(f"Erro: A ROI resultante para a simulação {i} é inválida.")
-
-    print("\n--- Processamento Concluído ---")
-    if todos_os_dados_consolidados:
-        df_consolidado = pd.DataFrame(todos_os_dados_consolidados)
+        # --- INICIALIZAÇÃO DA SUPER RESOLUÇÃO (IA) ---
+        # Tenta carregar o modelo de IA se disponível, senão usa algoritmo matemático
+        self.sr = cv2.dnn_superres.DnnSuperResImpl_create()
+        self.use_ai_upscale = False
         try:
-            df_consolidado.to_csv(output_csv_consolidado, index=False)
-            print(f"Relatório consolidado salvo em '{output_csv_consolidado}'")
-            pd.set_option('display.float_format', '{:.6f}'.format)
-            print("\n--- Amostra do Relatório Consolidado ---")
-            print(df_consolidado.head())
-            print(f"\nTotal de pontos detectados em todas as simulações: {len(df_consolidado)}")
-        except Exception as e:
-            print(f"Erro ao salvar o relatório consolidado: {e}")
-    else:
-        print("Nenhum ponto detectado. Relatório consolidado não gerado.")
+            # Se você tiver o arquivo 'EDSR_x4.pb', coloque na mesma pasta e descomente abaixo
+            # self.sr.readModel("EDSR_x4.pb")
+            # self.sr.setModel("edsr", 4) 
+            # self.use_ai_upscale = True
+            pass
+        except:
+            print("Modelo de IA não encontrado. Usando redimensionamento Bicúbico de Alta Qualidade.")
 
+    def capture_and_stack(self, num_frames=60):
+        """
+        Captura múltiplos frames e faz a média para eliminar ruído (granulado).
+        Processamento 100% em memória RAM.
+        """
+        print(f"\n--- [CAPTURA INICIADA] ---")
+        print(f"Capturando {num_frames} frames para Super-Empilhamento...")
+        frames = []
+        
+        # Janela de progresso
+        progress_window = "Progresso da Captura"
+        cv2.namedWindow(progress_window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(progress_window, 400, 100)
+        
+        for i in range(num_frames):
+            ret, frame = self.cap.read()
+            if ret:
+                # Converte para float32 para evitar estouro de valor na soma
+                frames.append(frame.astype(np.float32))
+                
+                # Exibe o progresso
+                progress_img = np.zeros((100, 400), dtype=np.uint8)
+                progress_text = f"Capturando frame: {i+1}/{num_frames}"
+                cv2.putText(progress_img, progress_text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.imshow(progress_window, progress_img)
+                cv2.waitKey(1) # Essencial para o OpenCV atualizar a janela
+            else:
+                print(f"Falha ao capturar frame {i}")
+        
+        cv2.destroyWindow(progress_window)
+
+        if not frames:
+            return None
+
+        print("Fundindo imagens para eliminar ruído...")
+        # Calcula a média de todos os frames (Empilhamento)
+        stack_img = np.mean(frames, axis=0)
+        
+        # Converte de volta para uint8 (imagem padrão 0-255)
+        return stack_img.astype(np.uint8)
+
+    def correct_lens_distortion(self, image):
+        """
+        Remove a distorção 'Olho de Peixe' para deixar a imagem reta.
+        """
+        h, w = image.shape[:2]
+        # Otimiza a matriz da câmera para o novo tamanho
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.mtx, self.dist, (w,h), 1, (w,h))
+        
+        # Desfaz a distorção
+        dst = cv2.undistort(image, self.mtx, self.dist, None, newcameramtx)
+        
+        # Recorta a imagem para remover as bordas pretas curvas geradas pela correção
+        x, y, w, h = roi
+        if w > 0 and h > 0:
+            dst = dst[y:y+h, x:x+w]
+        return dst
+
+    def enhance_image_quality(self, image):
+        """
+        Aplica pós-processamento profissional: CLAHE, Nitidez e Upscaling.
+        """
+        # print("Aplicando pós-processamento avançado...") # REMOVIDO
+        
+        # 1. Upscaling (Aumentar resolução e qualidade)
+        if self.use_ai_upscale:
+            # Via Inteligência Artificial (Lento, mas perfeito)
+            print("Usando Upscale de IA...")
+            image = self.sr.upsample(image)
+        else:
+            # Via Bicúbica (Rápido e muito bom com imagem empilhada)
+            # Aumenta 2x o tamanho para análise de precisão
+            # print("Usando Upscale Bicúbico...") # REMOVIDO
+            
+            # --- ALGORITMO REMOVIDO A PEDIDO ---
+            # image = cv2.resize(image, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            pass # Mantém a imagem original se a IA não estiver ativa
+
+        # 2. Redução de Ruído Cromático (Suaviza cores sem perder bordas)
+        # Como já fizemos empilhamento, usamos um valor baixo aqui para não borrar
+        # print("Reduzindo ruído cromático...") # REMOVIDO
+        
+        # --- ALGORITMO REMOVIDO A PEDIDO ---
+        # image = cv2.fastNlMeansDenoisingColored(image, None, 3, 3, 7, 21)
+
+        # 3. CLAHE (Equalização de Histograma Adaptativo)
+        # Melhora a iluminação local (tira sombras, reduz estouro de branco)
+        # print("Aplicando CLAHE para balanço de iluminação...") # REMOVIDO
+        
+        # --- ALGORITMO REMOVIDO A PEDIDO ---
+        # lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        # l, a, b = cv2.split(lab)
+        # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        # cl = clahe.apply(l)
+        # limg = cv2.merge((cl,a,b))
+        # image = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+        # 4. Sharpening (Aumento de Nitidez)
+        # print("Aplicando Nitidez...") # REMOVIDO
+        
+        # --- ALGORITMO REMOVIDO A PEDIDO ---
+        # kernel_sharpening = np.array([[-1,-1,-1], 
+        #                               [-1, 9,-1],
+        #                               [-1,-1,-1]])
+        # image = cv2.filter2D(image, -1, kernel_sharpening)
+
+        return image
+
+    def analyze_scene(self, image):
+        """
+        Realiza a segmentação baseada no esquema de cores HLS definido,
+        com agrupamento de contornos próximos para evitar contagem dupla de objetos tremidos.
+        """
+        print("Analisando cena (Isolamento e Agrupamento de Pontos)...")
+        hls = cv2.cvtColor(image, cv2.COLOR_BGR2HLS)
+        result_viz = image.copy()
+
+        # --- ESQUEMA DE CORES (Baseado nas nossas calibrações anteriores) ---
+        # Ajustado para a imagem pós-processada (que tem mais contraste)
+        
+        # 1. Mancha de Óleo (Preto/Escuro)
+        # L < 60
+        mask_mancha = cv2.inRange(hls, (0, 0, 0), (180, 60, 255))
+
+        # 2. Alga (Cinza/Desaturado)
+        # S < 65 (mas não preto)
+        mask_alga_raw = cv2.inRange(hls, (0, 0, 0), (180, 255, 65))
+        mask_alga = cv2.bitwise_and(mask_alga_raw, cv2.bitwise_not(mask_mancha))
+
+        # 3. Navio (Colorido/Saturado)
+        # S > 65
+        mask_navio = cv2.inRange(hls, (0, 0, 65), (180, 255, 255))
+        mask_navio = cv2.bitwise_and(mask_navio, cv2.bitwise_not(mask_mancha)) # Garante que não é preto
+
+        # --- Dicionário de Detecção ---
+        detections = {
+            "Mancha de Oleo": (mask_mancha, (0, 0, 255)), # Vermelho
+            "Alga": (mask_alga, (0, 255, 255)),           # Amarelo
+            "Navio": (mask_navio, (255, 0, 0))            # Azul
+        }
+
+        final_count = {"Mancha de Oleo": 0, "Alga": 0, "Navio": 0}
+
+        # Iterar sobre cada tipo de detecção
+        for label, (mask, color) in detections.items():
+            # Morfologia para limpar ruído (traços de latitude/longitude finos)
+            kernel = np.ones((3,3), np.uint8)
+            mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel) # Remove ruído pequeno
+            mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel) # Fecha buracos no objeto
+
+            contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            valid_objects_data = [] # Para armazenar (center, radius, contour_area) dos objetos válidos
+
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area > 400: # Filtro de Área
+                    (x,y), radius = cv2.minEnclosingCircle(cnt)
+                    center = (int(x),int(y))
+                    radius = int(radius)
+                    
+                    perimeter = cv2.arcLength(cnt, True)
+                    if perimeter == 0: continue
+                    circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                    
+                    if circularity > 0.5: # Filtro de Circularidade
+                        valid_objects_data.append({"center": center, "radius": radius, "area": area, "contour": cnt})
+
+            # --- Agrupamento de Objetos Próximos ---
+            if not valid_objects_data:
+                continue
+
+            # Raio de agrupamento: considere 1.5x o raio médio dos objetos. Ajuste conforme necessário.
+            # Se seus objetos na simulação são todos de tamanho parecido, um valor fixo pode ser melhor.
+            # Aqui, vamos usar um valor adaptativo, mas você pode definir um 'cluster_distance_threshold = 50' (por exemplo)
+            # para 50 pixels de distância.
+            
+            avg_radius = np.mean([obj['radius'] for obj in valid_objects_data]) if valid_objects_data else 0
+            cluster_distance_threshold = max(50, int(avg_radius * 1.5)) # Mínimo de 50 pixels, ou 1.5x o raio médio
+            print(f"  {label}: Raio médio = {avg_radius:.2f}, Threshold de agrupamento = {cluster_distance_threshold} pixels")
+
+            # Lista para guardar os objetos já agrupados
+            grouped_objects = []
+            
+            # Percorre todos os objetos válidos para tentar agrupá-los
+            for obj1_idx, obj1 in enumerate(valid_objects_data):
+                if obj1.get('grouped', False): # Se já foi agrupado, pule
+                    continue
+
+                current_group = [obj1]
+                obj1['grouped'] = True # Marca como agrupado
+
+                for obj2_idx, obj2 in enumerate(valid_objects_data):
+                    if obj1_idx == obj2_idx or obj2.get('grouped', False): # Não compare consigo mesmo ou já agrupado
+                        continue
+
+                    dist = np.linalg.norm(np.array(obj1['center']) - np.array(obj2['center']))
+                    
+                    if dist < cluster_distance_threshold:
+                        current_group.append(obj2)
+                        obj2['grouped'] = True # Marca como agrupado
+                
+                grouped_objects.append(current_group)
+
+            # Para cada grupo, determine um único objeto representativo (ex: pelo centro médio e raio máximo)
+            for group in grouped_objects:
+                if not group: continue
+
+                # Calcula o centro médio do grupo
+                mean_center_x = int(np.mean([obj['center'][0] for obj in group]))
+                mean_center_y = int(np.mean([obj['center'][1] for obj in group]))
+                mean_center = (mean_center_x, mean_center_y)
+
+                # Pega o raio do maior objeto no grupo, ou um raio médio
+                max_radius = int(max([obj['radius'] for obj in group]))
+                
+                # Desenha o objeto agrupado
+                cv2.circle(result_viz, mean_center, max_radius + 5, color, 3) 
+                cv2.putText(result_viz, label, (mean_center[0]-40, mean_center[1]-max_radius-15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3) 
+                final_count[label] += 1
+
+        print(f"--- Relatório Final: {final_count} ---")
+        return result_viz, final_count
+
+    def process_and_analyze(self):
+        """
+        Função chamada pelo ESPAÇO.
+        Executa toda a pipeline de processamento e exibe o resultado.
+        """
+        
+        # 1. Captura e Empilhamento (Stacking)
+        # Tira 60 fotos e funde em uma única imagem de alta qualidade
+        super_image = self.capture_and_stack(num_frames=60)
+        
+        if super_image is None:
+            print("Erro na captura.")
+            return
+
+        # 2. Correção Física (Lente)
+        rectilinear_image = self.correct_lens_distortion(super_image)
+
+        # 3. Melhoria de Qualidade (Upscale + Luz + Nitidez)
+        final_high_res = self.enhance_image_quality(rectilinear_image)
+
+        # 4. Análise Computacional
+        analyzed_image, report = self.analyze_scene(final_high_res)
+
+        # 5. Exibição e Salvamento Final
+        timestamp = int(time.time())
+        filename = f"resultado_analise_pro_{timestamp}.png"
+        
+        cv2.imwrite(filename, analyzed_image)
+        print(f"Imagem de alta fidelidade salva como: {filename}")
+        
+        # Redimensiona apenas para exibir na tela (a salva está em full HD/4K)
+        display_h = 800
+        ratio = display_h / analyzed_image.shape[0]
+        display_dim = (int(analyzed_image.shape[1] * ratio), display_h)
+        display_img = cv2.resize(analyzed_image, display_dim)
+        
+        # Adiciona o relatório à imagem de exibição
+        y_offset = 40
+        for key, value in report.items():
+            text = f"{key}: {value}"
+            cv2.putText(display_img, text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            y_offset += 40
+
+        # Mostra o resultado em uma NOVA janela
+        result_window_name = f"Resultado da Analise {timestamp}"
+        cv2.imshow(result_window_name, display_img)
+        print("Análise concluída. Exibindo em nova janela.")
+        print("--- Pressione [ESPAÇO] para nova análise ou [ESC] para sair ---")
+
+
+    def start_interactive_mode(self):
+        """
+        MODO PRINCIPAL: Exibe o feed ao vivo em modo janela.
+        Aguarda o ESPAÇO para disparar a análise.
+        """
+        
+        window_name = "Live Feed - Pressione ESPACO para Analisar | ESC para Sair"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+        print("--- Sistema de Visão Profissional Iniciado ---")
+        print("Feed ao vivo em MODO JANELA (redimensionavel).")
+        print("Pressione [ESPACO] para capturar e analisar a cena.")
+        print("Pressione [ESC] para sair.")
+
+        # Variáveis para cálculo de FPS
+        start_time = time.time()
+        frame_counter = 0
+        fps_display = "FPS: Calculando..."
+
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("Erro ao ler frame. Tentando reconectar...")
+                time.sleep(1)
+                continue
+
+            # Redimensiona o frame para exibição em tempo real se for muito grande
+            display_frame = frame.copy()
+            if display_frame.shape[1] > 1280: # Se largura maior que 1280, redimensiona
+                scale_factor = 1280 / display_frame.shape[1]
+                display_frame = cv2.resize(display_frame, (1280, int(display_frame.shape[0] * scale_factor)))
+
+
+            # --- Cálculo de FPS ---
+            frame_counter += 1
+            elapsed_time = time.time() - start_time
+            if elapsed_time > 1.0: # Atualiza a cada 1 segundo
+                fps_display = f"FPS: {frame_counter / elapsed_time:.2f}"
+                frame_counter = 0
+                start_time = time.time()
+            # --- Fim Cálculo de FPS ---
+
+            # Adiciona texto de ajuda no frame
+            display_text = "AO VIVO | [ESPACO] = Analisar | [ESC] = Sair"
+            cv2.putText(display_frame, display_text, (20, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
+
+            # Adiciona texto de FPS no frame
+            cv2.putText(display_frame, fps_display, (20, 100), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
+
+            cv2.imshow(window_name, display_frame) # Exibe o frame redimensionado
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == 27: # Tecla ESC
+                print("Saindo do sistema...")
+                break
+            
+            elif key == 32: # Tecla ESPAÇO
+                print("\n[TRIGGER] Tecla ESPACO pressionada!")
+                self.process_and_analyze()
+                
+
+        # Limpeza final
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    try:
+        # Se tiver várias câmeras, tente alterar o índice para 1 ou 2
+        system = ProfessionalVisionSystem(camera_index=0)
+        
+        # Inicia o modo interativo em vez do 'run' linear
+        system.start_interactive_mode() 
+        
+    except ValueError as e:
+        print(f"ERRO: {e}")
+        print("Verifique se a câmera está conectada e o índice (camera_index) está correto.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Um erro inesperado ocorreu: {e}")
+        sys.exit(1)
