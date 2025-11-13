@@ -1,0 +1,319 @@
+import cv2
+import numpy as np
+import pandas as pd
+import math
+import os
+import time
+
+# --- 1. FUNÇÕES AUXILIARES ---
+# (distancia, mapear_coordenadas - sem alterações)
+def distancia(p1, p2):
+    if p1 is None or p2 is None or len(p1) < 2 or len(p2) < 2: return float('inf')
+    if isinstance(p1, (tuple, list)) and isinstance(p2, (tuple, list)):
+        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+    elif isinstance(p1, (np.ndarray, list)) and isinstance(p2, (np.ndarray, list)):
+        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+    return float('inf')
+
+def mapear_coordenadas(ponto_pixel, dimensoes_imagem, range_lon, range_lat):
+    px, py = ponto_pixel
+    largura, altura = dimensoes_imagem
+    if largura == 0 or altura == 0: return (0.0, 0.0)
+    lon = range_lon[0] + (px / largura) * (range_lon[1] - range_lon[0])
+    lat = range_lat[1] - (py / altura) * (range_lat[1] - range_lat[0])
+    return (round(lon, 6), round(lat, 6))
+
+# --- FUNÇÃO DE VISUALIZAÇÃO ---
+# (visualizar_deteccoes - sem alterações)
+def visualizar_deteccoes(imagem, pontos_detectados, navio_poluidor_coords_pixel=None):
+    imagem_visual = imagem.copy()
+    for ponto in pontos_detectados:
+        if 'coords_pixel_original' not in ponto: continue
+        coords_pixel = ponto['coords_pixel_original']
+        tipo = ponto.get('tipo', 'Desconhecido')
+        centro = (int(coords_pixel[0]), int(coords_pixel[1]))
+
+        if 'Navio' in tipo: cor = (255, 0, 0)
+        elif tipo == 'Mancha de Oleo': cor = (0, 0, 255)
+        else: cor = (0, 255, 255)
+
+        raio_visual = 20 if tipo == 'Alga' else (35 if 'Navio' in tipo else 30)
+        cv2.circle(imagem_visual, centro, raio_visual, cor, 3)
+
+        texto, texto_cor = tipo, cor
+        if navio_poluidor_coords_pixel is not None and 'Navio Poluidor' in tipo:
+             dist_sq = (centro[0] - navio_poluidor_coords_pixel[0])**2 + (centro[1] - navio_poluidor_coords_pixel[1])**2
+             if dist_sq < (20**2):
+                cv2.circle(imagem_visual, centro, raio_visual + 10, (0, 165, 255), 3)
+                texto_cor = (0, 255, 100)
+
+        cv2.putText(imagem_visual, texto, (centro[0] - 50, centro[1] - raio_visual - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, texto_cor, 2)
+    return imagem_visual
+
+# --- 2. FUNÇÕES DE DETECÇÃO ---
+# (detectar_e_agrupar_mancha, detectar_navios_e_algas_hibrido - sem alterações)
+def detectar_e_agrupar_mancha(imagem, params_mancha, brightness_max_mancha):
+    mask_mancha = np.zeros(imagem.shape[:2], dtype="uint8")
+    componentes_mancha = []
+    try:
+        imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+        imagem_suavizada = cv2.medianBlur(imagem_cinza, 5)
+        circulos_pequenos = cv2.HoughCircles(imagem_suavizada, cv2.HOUGH_GRADIENT,
+                                             dp=params_mancha['dp'], minDist=params_mancha['minDist'],
+                                             param1=params_mancha['param1'], param2=params_mancha['param2'],
+                                             minRadius=params_mancha['minRadius'], maxRadius=params_mancha['maxRadius'])
+        if circulos_pequenos is not None:
+            circulos_pequenos = np.uint16(np.around(circulos_pequenos))
+            for i in circulos_pequenos[0, :]:
+                centro = (i[0], i[1])
+                raio = i[2]
+                if 0 <= centro[1] < imagem.shape[0] and 0 <= centro[0] < imagem.shape[1]:
+                    bgr = imagem[centro[1], centro[0]]
+                    hsv_pixel = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
+                    if hsv_pixel[2] < brightness_max_mancha:
+                        componentes_mancha.append(centro)
+                        cv2.circle(mask_mancha, centro, raio + 3, 255, -1)
+
+        if componentes_mancha:
+            avg_x = int(np.mean([p[0] for p in componentes_mancha]))
+            avg_y = int(np.mean([p[1] for p in componentes_mancha]))
+            mancha_detectada = [{'tipo': 'Mancha de Oleo', 'coords_pixel': (avg_x, avg_y)}]
+            return mancha_detectada, mask_mancha
+    except Exception as e:
+        print(f"  > Erro ao detectar mancha: {e}")
+    return [], mask_mancha
+
+def detectar_navios_e_algas_hibrido(imagem, params_navios, paleta_hls_navios, paleta_hls_algas, sat_max_alga_auto, light_min_alga_auto, light_max_alga_auto):
+    pontos_finais = []
+    try:
+        imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+        imagem_suavizada = cv2.medianBlur(imagem_cinza, 11)
+        circulos_grandes = cv2.HoughCircles(imagem_suavizada, cv2.HOUGH_GRADIENT,
+                                            dp=params_navios['dp'], minDist=params_navios['minDist'],
+                                            param1=params_navios['param1'], param2=params_navios['param2'],
+                                            minRadius=params_navios['minRadius'], maxRadius=params_navios['maxRadius'])
+        
+        if circulos_grandes is not None:
+            circulos_grandes = np.uint16(np.around(circulos_grandes))
+            for i in circulos_grandes[0, :]:
+                centro = (i[0], i[1])
+                if 5 <= centro[1] < imagem.shape[0]-5 and 5 <= centro[0] < imagem.shape[1]-5:
+                    roi_centro = imagem[centro[1]-2:centro[1]+3, centro[0]-2:centro[0]+3]
+                    if roi_centro.size == 0: continue
+                    bgr_medio = np.mean(roi_centro, axis=(0, 1))
+                    hls_pixel = cv2.cvtColor(np.uint8([[bgr_medio]]), cv2.COLOR_BGR2HLS)[0][0]
+                    h, l, s = hls_pixel
+                    
+                    tipo_detectado = 'Desconhecido'
+
+                    for faixa in paleta_hls_navios:
+                        lower, upper = faixa
+                        hue_match = (lower[0] <= h <= upper[0])
+                        if lower[0] > upper[0]: hue_match = (h >= lower[0] or h <= upper[0])
+                        if hue_match and (lower[1] <= l <= upper[1]) and (lower[2] <= s <= upper[2]):
+                            tipo_detectado = 'Navio'
+                            break
+                    
+                    if tipo_detectado == 'Desconhecido':
+                        for faixa in paleta_hls_algas:
+                            lower, upper = faixa
+                            hue_match = (lower[0] <= h <= upper[0])
+                            if lower[0] > upper[0]: hue_match = (h >= lower[0] or h <= upper[0])
+                            if hue_match and (lower[1] <= l <= upper[1]) and (lower[2] <= s <= upper[2]):
+                                tipo_detectado = 'Alga'
+                                break
+
+                    if tipo_detectado == 'Desconhecido':
+                        if s <= sat_max_alga_auto and light_min_alga_auto <= l <= light_max_alga_auto:
+                            tipo_detectado = 'Alga'
+                        else:
+                            tipo_detectado = 'Navio'
+                    
+                    pontos_finais.append({'tipo': tipo_detectado, 'coords_pixel': centro})
+
+    except Exception as e:
+        print(f"  > Erro ao detectar navios/algas (Híbrido): {e}")
+    return pontos_finais
+
+# --- FUNÇÃO DE PRÉ-PROCESSAMENTO (para baixa qualidade) ---
+def pre_processar_frame(frame):
+    """Aplica filtros para melhorar a qualidade da imagem antes da detecção."""
+    frame_corrigido = frame
+    try:
+        hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+        h, l, s = cv2.split(hls)
+        l_equalizado = cv2.equalizeHist(l)
+        hls_equalizado = cv2.merge([h, l_equalizado, s])
+        frame_corrigido = cv2.cvtColor(hls_equalizado, cv2.COLOR_HLS2BGR)
+    except cv2.error as e:
+        print(f"  > Aviso: Falha na equalização de histograma ({e}). Usando frame original.")
+        frame_corrigido = frame.copy()
+
+    frame_sem_ruido = cv2.bilateralFilter(frame_corrigido, 9, 75, 75)
+    kernel_sharpen = np.array([[-1,-1,-1], [-1, 9,-1], [-1,-1,-1]])
+    frame_nitido = cv2.filter2D(frame_sem_ruido, -1, kernel_sharpen)
+    return frame_nitido
+
+# --- 3. BLOCO DE EXECUÇÃO PRINCIPAL (MODO CAPTURA) ---
+if __name__ == "__main__":
+    
+    # --- BLOCO DE CALIBRAGEM ---
+    ROI_PROPORCOES = {'y_start': 0.12, 'y_end': 0.93, 'x_start': 0.05, 'x_end': 0.96}
+    HOUGH_PARAMS_NAVIOS = {'dp': 1, 'minDist': 40, 'param1': 50, 'param2': 9, 'minRadius': 15, 'maxRadius': 55}
+    HOUGH_PARAMS_MANCHA = {'dp': 1, 'minDist': 5, 'param1': 50, 'param2': 7, 'minRadius': 5, 'maxRadius': 15}
+    OIL_SLICK_BRIGHTNESS_MAX = 95
+    SATURATION_MAX_ALGA_AUTO = 70
+    LIGHTNESS_MIN_ALGA_AUTO = 140
+    LIGHTNESS_MAX_ALGA_AUTO = 230
+    DISTANCIA_MINIMA_EXCLUSAO = 50 
+    RANGE_LONGITUDE = (-220, 220)
+    RANGE_LATITUDE = (-220, 220)
+
+    PALETA_HLS_NAVIOS = [
+        [np.array([5, 80, 200]), np.array([15, 110, 255])], [np.array([5, 90, 120]), np.array([15, 120, 160])],
+        [np.array([0, 180, 190]), np.array([8, 210, 220])], [np.array([16, 120, 180]), np.array([20, 160, 215])],
+        [np.array([21, 200, 170]), np.array([25, 230, 200])], [np.array([85, 170, 140]), np.array([102, 220, 180])],
+        [np.array([95, 130, 230]), np.array([100, 160, 255])], [np.array([130, 110, 220]), np.array([140, 140, 250])],
+        [np.array([140, 100, 160]), np.array([145, 130, 200])], [np.array([150, 190, 80]), np.array([155, 215, 110])],
+        [np.array([145, 180, 100]), np.array([150, 210, 130])], [np.array([158, 160, 170]), np.array([164, 190, 200])],
+        [np.array([175, 160, 220]), np.array([179, 190, 255])], [np.array([165, 50, 190]), np.array([172, 80, 220])],
+        [np.array([164, 90, 80]), np.array([168, 110, 110])]
+    ]
+    PALETA_HLS_ALGAS = [
+        [np.array([145, 180, 50]), np.array([150, 210, 75])], [np.array([0, 160, 0]), np.array([179, 190, 30])],
+        [np.array([5, 110, 40]), np.array([10, 140, 65])], [np.array([140, 130, 35]), np.array([148, 160, 60])]
+    ]
+    # --- FIM DO BLOCO ---
+
+    # --- INICIALIZAÇÃO DA CÂMERA ---
+    cap = cv2.VideoCapture(0) 
+    if not cap.isOpened():
+        print("Erro: Não foi possível abrir a câmera.")
+        exit()
+
+    print("--- Câmera ao Vivo ---")
+    print("Pressione [ESPAÇO] para capturar e analisar.")
+    print("Pressione [Q] para sair.")
+
+    while True:
+        # --- MODO 1: CÂMERA AO VIVO ---
+        ret, frame = cap.read()
+        if not ret:
+            print("Erro: Não foi possível ler o frame.")
+            break
+        
+        # Desenha um texto de ajuda na tela
+        cv2.putText(frame, "AO VIVO. Pressione [ESPACO] para analisar ou [Q] para sair.", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        cv2.imshow("Camera Live", frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            break
+        
+        # --- MODO 2: CAPTURAR E ANALISAR ---
+        if key == ord(' '): # Tecla de Espaço
+            print("\n--- Captura Realizada! Processando... ---")
+            
+            imagem_original = frame.copy()
+            
+            # 1. Pré-processamento (para baixa qualidade)
+            imagem_processada = pre_processar_frame(imagem_original)
+            
+            altura, largura, _ = imagem_processada.shape
+            
+            # 2. Calcular e Aplicar ROI
+            x_roi_start = int(largura * ROI_PROPORCOES['x_start'])
+            y_roi_start = int(altura * ROI_PROPORCOES['y_start'])
+            x_roi_end = int(largura * ROI_PROPORCOES['x_end'])
+            y_roi_end = int(altura * ROI_PROPORCOES['y_end'])
+
+            if x_roi_start >= x_roi_end or y_roi_start >= y_roi_end:
+                 print("Erro: ROI inválida na captura."); continue
+            
+            imagem_roi = imagem_processada[y_roi_start:y_roi_end, x_roi_start:x_roi_end].copy()
+
+            if imagem_roi.shape[0] > 0 and imagem_roi.shape[1] > 0:
+                
+                # 3. Hierarquia de Detecção
+                manchas, mascara_da_mancha = detectar_e_agrupar_mancha(imagem_roi, HOUGH_PARAMS_MANCHA, OIL_SLICK_BRIGHTNESS_MAX)
+
+                imagem_roi_sem_mancha = imagem_roi.copy()
+                kernel = np.ones((15, 15), np.uint8)
+                mascara_dilatada = cv2.dilate(mascara_da_mancha, kernel, iterations=1)
+                bg_y, bg_x = min(5, imagem_roi.shape[0]-1), min(5, imagem_roi.shape[1]-1)
+                cor_fundo_bgr = imagem_roi[bg_y, bg_x]
+                imagem_roi_sem_mancha[mascara_dilatada == 255] = tuple(map(int, cor_fundo_bgr))
+
+                navios_e_algas = detectar_navios_e_algas_hibrido(
+                    imagem_roi_sem_mancha, HOUGH_PARAMS_NAVIOS, PALETA_HLS_NAVIOS, PALETA_HLS_ALGAS,
+                    SATURATION_MAX_ALGA_AUTO, LIGHTNESS_MIN_ALGA_AUTO, LIGHTNESS_MAX_ALGA_AUTO
+                )
+                
+                # 4. Filtro de Exclusão (Anti-Fantasma)
+                pontos_filtrados = []
+                if manchas:
+                    mancha_centro_roi = manchas[0]['coords_pixel']
+                    for obj in navios_e_algas:
+                        obj_centro_roi = obj['coords_pixel']
+                        dist = distancia(mancha_centro_roi, obj_centro_roi)
+                        if dist > DISTANCIA_MINIMA_EXCLUSAO:
+                            pontos_filtrados.append(obj)
+                        else:
+                            print(f"  > Filtro: Removido {obj.get('tipo')} (falso positivo da mancha).")
+                    todos_os_pontos = manchas + pontos_filtrados
+                else:
+                    todos_os_pontos = manchas + navios_e_algas
+                
+                print(f"Total de pontos detectados: {len(todos_os_pontos)}")
+
+                # 5. Mapeamento e Análise de Proximidade
+                navio_poluidor_coords_pixel = None
+                for ponto in todos_os_pontos:
+                    if 'coords_pixel' not in ponto: continue
+                    ponto['coords_pixel_original'] = (ponto['coords_pixel'][0] + x_roi_start, ponto['coords_pixel'][1] + y_roi_start)
+                    # O mapeamento de Lon/Lat é simbólico no modo câmera
+                    ponto['coords_reais'] = mapear_coordenadas(ponto['coords_pixel_original'], (largura, altura), RANGE_LONGITUDE, RANGE_LATITUDE)
+
+                manchas_final = [p for p in todos_os_pontos if p.get('tipo') == 'Mancha de Oleo']
+                navios_final = [p for p in todos_os_pontos if p.get('tipo') == 'Navio']
+
+                if manchas_final and navios_final:
+                    mancha_oleo_final = manchas_final[0]
+                    menor_dist = float('inf')
+                    navio_poluidor = None
+                    for navio in navios_final:
+                         if 'coords_reais' in mancha_oleo_final and 'coords_reais' in navio:
+                             d = distancia(mancha_oleo_final['coords_reais'], navio['coords_reais'])
+                             if d < menor_dist:
+                                 menor_dist = d
+                                 navio_poluidor = navio
+                    if navio_poluidor:
+                        navio_poluidor['tipo'] = 'Navio Poluidor'
+                        if 'coords_pixel_original' in navio_poluidor:
+                            navio_poluidor_coords_pixel = navio_poluidor['coords_pixel_original']
+                        print(f"  > ANÁLISE COMPLETA: Navio Poluidor identificado!")
+                else:
+                    print("  > Análise de proximidade não realizada (sem mancha e/ou navios).")
+                
+                # 6. Exibir o Resultado (em uma nova janela)
+                imagem_resultado = visualizar_deteccoes(imagem_original, todos_os_pontos, navio_poluidor_coords_pixel)
+                cv2.rectangle(imagem_resultado, (x_roi_start, y_roi_start), (x_roi_end, y_roi_end), (0, 255, 0), 2)
+                
+                cv2.imshow("Resultado da Analise (Pressione 'q' para fechar esta janela)", imagem_resultado)
+
+                # Loop aninhado: espera o usuário fechar a janela de resultado
+                while True:
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        cv2.destroyWindow("Resultado da Analise (Pressione 'q' para fechar esta janela)")
+                        print("Voltando para a câmera ao vivo...")
+                        break
+            else:
+                print("Erro: A ROI resultante é inválida.")
+
+    # --- LIMPEZA ---
+    cap.release()
+    cv2.destroyAllWindows()
+    print("--- Programa encerrado ---")
