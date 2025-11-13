@@ -1,0 +1,224 @@
+import cv2
+import numpy as np
+import time
+import sys
+
+class ProfessionalVisionSystem:
+    def __init__(self, camera_index=0):
+        self.cap = cv2.VideoCapture(camera_index)
+        
+        # Configura a câmera para resolução máxima disponível
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        
+        if not self.cap.isOpened():
+            raise ValueError("Não foi possível abrir a câmera.")
+
+        # --- PARÂMETROS DE CALIBRAÇÃO DE LENTE (Estimativa para remover Olho de Peixe) ---
+        # Em um cenário real, isso é obtido fotografando um tabuleiro de xadrez.
+        # Estes valores são genéricos para "alisar" a imagem.
+        self.mtx = np.array([[1.00000000e+03, 0.00000000e+00, 9.60000000e+02],
+                             [0.00000000e+00, 1.00000000e+03, 5.40000000e+02],
+                             [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+        self.dist = np.array([-0.2, 0.1, 0, 0]) # Coeficientes de distorção (k1, k2, p1, p2)
+
+        # --- INICIALIZAÇÃO DA SUPER RESOLUÇÃO (IA) ---
+        # Tenta carregar o modelo de IA se disponível, senão usa algoritmo matemático
+        self.sr = cv2.dnn_superres.DnnSuperResImpl_create()
+        self.use_ai_upscale = False
+        try:
+            # Se você tiver o arquivo 'EDSR_x4.pb', coloque na mesma pasta e descomente abaixo
+            # self.sr.readModel("EDSR_x4.pb")
+            # self.sr.setModel("edsr", 4) 
+            # self.use_ai_upscale = True
+            pass
+        except:
+            print("Modelo de IA não encontrado. Usando redimensionamento Bicúbico de Alta Qualidade.")
+
+    def capture_and_stack(self, num_frames=60):
+        """
+        Captura múltiplos frames e faz a média para eliminar ruído (granulado).
+        Processamento 100% em memória RAM.
+        """
+        print(f"--- Iniciando captura de {num_frames} frames para Super-Empilhamento... ---")
+        frames = []
+        
+        for i in range(num_frames):
+            ret, frame = self.cap.read()
+            if ret:
+                # Converte para float32 para evitar estouro de valor na soma
+                frames.append(frame.astype(np.float32))
+            else:
+                print(f"Falha ao capturar frame {i}")
+        
+        if not frames:
+            return None
+
+        print("Fundindo imagens para eliminar ruído...")
+        # Calcula a média de todos os frames (Empilhamento)
+        stack_img = np.mean(frames, axis=0)
+        
+        # Converte de volta para uint8 (imagem padrão 0-255)
+        return stack_img.astype(np.uint8)
+
+    def correct_lens_distortion(self, image):
+        """
+        Remove a distorção 'Olho de Peixe' para deixar a imagem reta.
+        """
+        h, w = image.shape[:2]
+        # Otimiza a matriz da câmera para o novo tamanho
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.mtx, self.dist, (w,h), 1, (w,h))
+        
+        # Desfaz a distorção
+        dst = cv2.undistort(image, self.mtx, self.dist, None, newcameramtx)
+        
+        # Recorta a imagem para remover as bordas pretas curvas geradas pela correção
+        x, y, w, h = roi
+        if w > 0 and h > 0:
+            dst = dst[y:y+h, x:x+w]
+        return dst
+
+    def enhance_image_quality(self, image):
+        """
+        Aplica pós-processamento profissional: CLAHE, Nitidez e Upscaling.
+        """
+        print("Aplicando pós-processamento avançado...")
+        
+        # 1. Upscaling (Aumentar resolução e qualidade)
+        if self.use_ai_upscale:
+            # Via Inteligência Artificial (Lento, mas perfeito)
+            image = self.sr.upsample(image)
+        else:
+            # Via Bicúbica (Rápido e muito bom com imagem empilhada)
+            # Aumenta 2x o tamanho para análise de precisão
+            image = cv2.resize(image, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+        # 2. Redução de Ruído Cromático (Suaviza cores sem perder bordas)
+        # Como já fizemos empilhamento, usamos um valor baixo aqui para não borrar
+        image = cv2.fastNlMeansDenoisingColored(image, None, 3, 3, 7, 21)
+
+        # 3. CLAHE (Equalização de Histograma Adaptativo)
+        # Melhora a iluminação local (tira sombras, reduz estouro de branco)
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl,a,b))
+        image = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+        # 4. Sharpening (Aumento de Nitidez)
+        # Cria um kernel de nitidez para realçar as bordas dos pontos
+        kernel_sharpening = np.array([[-1,-1,-1], 
+                                      [-1, 9,-1],
+                                      [-1,-1,-1]])
+        image = cv2.filter2D(image, -1, kernel_sharpening)
+
+        return image
+
+    def analyze_scene(self, image):
+        """
+        Realiza a segmentação baseada no esquema de cores HLS definido.
+        """
+        print("Analisando cena (Isolamento de Pontos)...")
+        hls = cv2.cvtColor(image, cv2.COLOR_BGR2HLS)
+        result_viz = image.copy()
+
+        # --- ESQUEMA DE CORES (Baseado nas nossas calibrações anteriores) ---
+        # Ajustado para a imagem pós-processada (que tem mais contraste)
+        
+        # 1. Mancha de Óleo (Preto/Escuro)
+        # L < 60
+        mask_mancha = cv2.inRange(hls, (0, 0, 0), (180, 60, 255))
+
+        # 2. Alga (Cinza/Desaturado)
+        # S < 65 (mas não preto)
+        mask_alga_raw = cv2.inRange(hls, (0, 0, 0), (180, 255, 65))
+        mask_alga = cv2.bitwise_and(mask_alga_raw, cv2.bitwise_not(mask_mancha))
+
+        # 3. Navio (Colorido/Saturado)
+        # S > 65
+        mask_navio = cv2.inRange(hls, (0, 0, 65), (180, 255, 255))
+        mask_navio = cv2.bitwise_and(mask_navio, cv2.bitwise_not(mask_mancha)) # Garante que não é preto
+
+        # --- Dicionário de Detecção ---
+        detections = {
+            "Mancha de Oleo": (mask_mancha, (0, 0, 255)), # Vermelho
+            "Alga": (mask_alga, (0, 255, 255)),           # Amarelo
+            "Navio": (mask_navio, (255, 0, 0))            # Azul
+        }
+
+        count = {"Mancha de Oleo": 0, "Alga": 0, "Navio": 0}
+
+        # Encontra contornos e desenha
+        for label, (mask, color) in detections.items():
+            # Morfologia para limpar ruído (traços de latitude/longitude finos)
+            kernel = np.ones((3,3), np.uint8)
+            mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel) # Remove ruído pequeno
+            mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel) # Fecha buracos no objeto
+
+            contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                # Filtro de Área: Ignora traços muito pequenos (ruído) ou linhas finas
+                if area > 100: 
+                    # Encontra círculo envolvente para ficar bonito visualmente
+                    (x,y), radius = cv2.minEnclosingCircle(cnt)
+                    center = (int(x),int(y))
+                    radius = int(radius)
+                    
+                    # Filtro Extra: Circularidade (Navios e Algas são redondos, linhas não)
+                    perimeter = cv2.arcLength(cnt, True)
+                    if perimeter == 0: continue
+                    circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                    
+                    # Se for muito alongado (linha de grade), ignoramos.
+                    # Objetos redondos tem circularidade perto de 1.0. Linhas perto de 0.
+                    if circularity > 0.5: 
+                        cv2.circle(result_viz, center, radius + 5, color, 2)
+                        cv2.putText(result_viz, label, (center[0]-20, center[1]-radius-10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        count[label] += 1
+
+        print(f"Relatório Final: {count}")
+        return result_viz
+
+    def run(self):
+        # 1. Captura e Empilhamento (Stacking)
+        # Tira 60 fotos e funde em uma única imagem de alta qualidade
+        super_image = self.capture_and_stack(num_frames=60)
+        
+        if super_image is None:
+            print("Erro na captura.")
+            return
+
+        # 2. Correção Física (Lente)
+        rectilinear_image = self.correct_lens_distortion(super_image)
+
+        # 3. Melhoria de Qualidade (Upscale + Luz + Nitidez)
+        final_high_res = self.enhance_image_quality(rectilinear_image)
+
+        # 4. Análise Computacional
+        analyzed_image = self.analyze_scene(final_high_res)
+
+        # 5. Exibição e Salvamento Final
+        timestamp = int(time.time())
+        filename = f"resultado_analise_pro_{timestamp}.png"
+        
+        cv2.imwrite(filename, analyzed_image)
+        print(f"Imagem de alta fidelidade salva como: {filename}")
+        
+        # Redimensiona apenas para exibir na tela (a salva está em full HD/4K)
+        display_h = 800
+        ratio = display_h / analyzed_image.shape[0]
+        display_dim = (int(analyzed_image.shape[1] * ratio), display_h)
+        display_img = cv2.resize(analyzed_image, display_dim)
+        
+        cv2.imshow("Resultado Profissional", display_img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    # Se tiver várias câmeras, tente alterar o índice para 1 ou 2
+    system = ProfessionalVisionSystem(camera_index=0)
+    system.run()
